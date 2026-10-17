@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta charset="UTF-8" />
+    <title>Static Image Emotion Detection</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+
+<body>
+    <div class="container">
+        <a href="/" class="back">← Back</a>
+        <h1>📷 Static Image Emotion Detection</h1>
+
+        <div class="upload-box">
+            <input type="file" id="imageInput" accept="image/*" />
+            <button id="analyzeBtn">Analyze</button>
+        </div>
+
+        <div id="loading" class="hidden">Analyzing... please wait ⏳</div>
+
+        <div id="results" class="hidden">
+            <h2>Result <span id="orientationTag"></span></h2>
+            <img id="annotatedImg" alt="Annotated result" />
+
+            <h2>Emotion Scores per Face</h2>
+            <div id="chartsContainer"></div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+
+</html>

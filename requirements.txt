@@ -1,0 +1,10 @@
+flask
+flask-socketio
+gevent
+gevent-websocket
+opencv-python
+mediapipe==0.10.21
+deepface
+tf-keras
+numpy==1.26.4
+Pillow

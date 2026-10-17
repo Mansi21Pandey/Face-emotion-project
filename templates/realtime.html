@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta charset="UTF-8" />
+    <title>Real-Time Emotion Detection</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+</head>
+
+<body>
+    <div class="container">
+        <a href="/" class="back">← Back</a>
+        <h1>🎥 Real-Time Face Emotion Recognition</h1>
+
+        <div class="video-wrapper">
+            <video id="video" autoplay playsinline muted></video>
+            <img id="output" alt="Processed output" />
+        </div>
+
+        <div class="controls">
+            <button id="startBtn">Start Camera</button>
+            <button id="stopBtn" disabled>Stop</button>
+            <span id="status">Idle</span>
+        </div>
+
+        <div id="liveEmotions"></div>
+    </div>
+
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+
+</html>

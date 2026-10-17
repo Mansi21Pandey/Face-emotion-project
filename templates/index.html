@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta charset="UTF-8" />
+    <title>Face Emotion Recognition</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+
+<body>
+    <div class="container">
+        <h1>😊 Face Emotion Recognition 😐</h1>
+        <p class="subtitle">Choose a mode to begin</p>
+
+        <div class="cards">
+            <a href="/static-image" class="card">
+                <h2>📷 Static Image</h2>
+                <p>Upload a photo and detect emotions of every face in it.</p>
+            </a>
+
+            <a href="/realtime" class="card">
+                <h2>🎥 Real-Time Webcam</h2>
+                <p>Use your webcam to detect emotions live.</p>
+            </a>
+        </div>
+    </div>
+</body>
+
+</html>
