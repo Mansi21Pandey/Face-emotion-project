@@ -182,6 +182,7 @@ def predict_image():
 
         except Exception as e:
             import traceback
+            print(f"Error analyzing face {face_number}: {e}", flush=True)
             traceback.print_exc()
 
     # Encode annotated image to base64
