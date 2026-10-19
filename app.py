@@ -107,6 +107,7 @@ def predict_image():
         return jsonify({"error": "Empty filename"}), 400
 
     # Read image from request
+    print("PREDICT_IMAGE: request received", flush=True)
     file_bytes = np.frombuffer(file.read(), np.uint8)
     img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
@@ -115,6 +116,11 @@ def predict_image():
 
     # Detect faces with rotation logic
     img, detections, orientation = detect_faces_with_rotation(img)
+    print(
+    f"PREDICT_IMAGE: detections={len(detections)}, "
+    f"orientation={orientation}",
+    flush=True
+)
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     annotated = img_rgb.copy()
 
