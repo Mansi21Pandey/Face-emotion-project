@@ -117,10 +117,10 @@ def predict_image():
     # Detect faces with rotation logic
     img, detections, orientation = detect_faces_with_rotation(img)
     print(
-    f"PREDICT_IMAGE: detections={len(detections)}, "
-    f"orientation={orientation}",
-    flush=True
-)
+        f"PREDICT_IMAGE: detections={len(detections)}, "
+        f"orientation={orientation}",
+        flush=True
+    )
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     annotated = img_rgb.copy()
 
@@ -150,6 +150,7 @@ def predict_image():
         try:
             face_rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
             face_pil = Image.fromarray(face_rgb)
+            print(f"DeepFace: analyzing face {face_number}", flush=True)
             analysis = DeepFace.analyze(
                 img_path=np.array(face_pil),
                 actions=["emotion"],
@@ -180,7 +181,8 @@ def predict_image():
             )
 
         except Exception as e:
-            print(f"Face {face_number} analysis error:", e)
+            import traceback
+            traceback.print_exc()
 
     # Encode annotated image to base64
     annotated_bgr = cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR)
