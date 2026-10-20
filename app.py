@@ -1,17 +1,10 @@
-
 import os
 import base64
 import time
 import traceback
-
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["TF_NUM_INTRAOP_THREADS"] = "1"
-os.environ["TF_NUM_INTEROP_THREADS"] = "1"
-
 import cv2
-import mediapipe as mp
 import numpy as np
-from deepface import DeepFace
+import onnxruntime as ort
 from flask import Flask, render_template, request, jsonify
 from flask_socketio import SocketIO, emit
 
@@ -37,23 +30,81 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-mp_face = mp.solutions.face_detection
+FACE_CASCADE = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
 
 # =====================================
-# HELPER: GET FIRST ANALYSIS RESULT
+# LIGHTWEIGHT ONNX EMOTION MODEL
 # =====================================
 
-def get_analysis_result(analysis):
-    """Handle DeepFace results returned as a list or dictionary."""
-    if isinstance(analysis, list):
-        if not analysis:
-            raise ValueError("DeepFace returned an empty result.")
-        return analysis[0]
+MODEL_PATH = os.path.join(
+    BASE_DIR, "models", "emotion-ferplus-8.onnx"
+)
 
-    if isinstance(analysis, dict):
-        return analysis
+emotion_session = ort.InferenceSession(
+    MODEL_PATH,
+    providers=["CPUExecutionProvider"],
+)
 
-    raise ValueError("Unexpected DeepFace result format.")
+
+# FER+ model ke original class names
+EMOTION_LABELS = [
+    "neutral",
+    "happiness",
+    "surprise",
+    "sadness",
+    "anger",
+    "disgust",
+    "fear",
+    "contempt",
+]
+
+# Frontend ke liye familiar emotion names
+EMOTION_DISPLAY_NAMES = {
+    "neutral": "neutral",
+    "happiness": "happy",
+    "surprise": "surprise",
+    "sadness": "sad",
+    "anger": "angry",
+    "disgust": "disgust",
+    "fear": "fear",
+    "contempt": "contempt",
+}
+
+
+def predict_emotion(face_bgr):
+    """Predict emotions from a cropped face using the ONNX model."""
+
+    # BGR image ko grayscale mein convert karo
+    gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
+
+    # Model ko 64x64 grayscale input chahiye
+    resized = cv2.resize(gray, (64, 64))
+
+    # Expected input shape: (1, 1, 64, 64)
+    input_data = resized.astype(np.float32).reshape(1, 1, 64, 64)
+
+    # ONNX inference
+    input_name = emotion_session.get_inputs()[0].name
+    output = emotion_session.run(None, {input_name: input_data})[0]
+
+    # Stable softmax: scores ko probabilities mein badlo
+    logits = output[0].astype(np.float64)
+    logits = logits - np.max(logits)
+    probabilities = np.exp(logits)
+    probabilities = probabilities / np.sum(probabilities)
+
+    # Frontend-friendly emotion scores, percentage mein
+    scores = {
+        EMOTION_DISPLAY_NAMES[label]: float(probability * 100)
+        for label, probability in zip(EMOTION_LABELS, probabilities)
+    }
+
+    dominant = max(scores, key=scores.get)
+    confidence = scores[dominant]
+
+    return dominant, confidence, scores
 
 
 # =====================================
@@ -80,43 +131,32 @@ def realtime_page():
 # =====================================
 
 def detect_faces_with_rotation(img):
-    """Try original and two rotated orientations."""
-
     rotations = [
         ("Original", img),
-        (
-            "Rotated clockwise",
-            cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE),
-        ),
-        (
-            "Rotated counterclockwise",
-            cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE),
-        ),
+        ("Rotated clockwise", cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)),
+        ("Rotated counterclockwise", cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)),
     ]
 
     best_img = img
-    best_detections = []
+    best_faces = []
     best_orientation = "Original"
 
     for orientation, candidate in rotations:
-        rgb_candidate = cv2.cvtColor(
-            candidate, cv2.COLOR_BGR2RGB
+        gray = cv2.cvtColor(candidate, cv2.COLOR_BGR2GRAY)
+
+        faces = FACE_CASCADE.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(30, 30),
         )
 
-        with mp_face.FaceDetection(
-            model_selection=0,
-            min_detection_confidence=0.4,
-        ) as detector:
-            result = detector.process(rgb_candidate)
-            detections = result.detections or []
-
-        if len(detections) > len(best_detections):
+        if len(faces) > len(best_faces):
             best_img = candidate.copy()
-            best_detections = detections
+            best_faces = faces
             best_orientation = orientation
 
-    return best_img, best_detections, best_orientation
-
+    return best_img, best_faces, best_orientation
 
 # =====================================
 # STATIC IMAGE PREDICTION
@@ -190,14 +230,13 @@ def predict_image():
         face_results = []
 
         # Analyze each detected face
-        for face_number, detection in enumerate(detections, start=1):
+        for face_number, (x, y, face_w, face_h) in enumerate(detections, start=1):
             try:
-                box = detection.location_data.relative_bounding_box
+                x1 = max(0, int(x))
+                y1 = max(0, int(y))
+                x2 = min(w, int(x + face_w))
+                y2 = min(h, int(y + face_h))
 
-                x1 = max(0, int(box.xmin * w))
-                y1 = max(0, int(box.ymin * h))
-                x2 = min(w, int((box.xmin + box.width) * w))
-                y2 = min(h, int((box.ymin + box.height) * h))
 
                 if x2 <= x1 or y2 <= y1:
                     continue
@@ -213,45 +252,28 @@ def predict_image():
 
                 if face_crop.size == 0:
                     continue
-
-                face_rgb = cv2.cvtColor(
-                    face_crop, cv2.COLOR_BGR2RGB
-                )
-
                 print(
-                    f"DeepFace: starting face {face_number}; "
+                    f"ONNX: predicting face {face_number}; "
                     f"crop={face_crop.shape[1]}x{face_crop.shape[0]}",
                     flush=True,
                 )
 
                 analysis_start = time.time()
 
-                analysis = DeepFace.analyze(
-                    img_path=face_rgb,
-                    actions=["emotion"],
-                    enforce_detection=False,
-                    silent=True,
-                    detector_backend="skip",
+                dominant, confidence, emotion_scores = predict_emotion(
+                    face_crop
                 )
 
                 print(
-                    f"DeepFace: face {face_number} completed in "
+                    f"ONNX: face {face_number} completed in "
                     f"{time.time() - analysis_start:.2f}s",
                     flush=True,
                 )
 
-                result = get_analysis_result(analysis)
-                emotion_scores = result["emotion"]
-
-                dominant = max(
-                    emotion_scores, key=emotion_scores.get
-                )
-                confidence = float(emotion_scores[dominant])
-
                 face_results.append({
                     "face_number": face_number,
                     "emotion": dominant,
-                    "confidence": round(confidence, 2),
+                    "confidence": round(float(confidence), 2),
                     "scores": {
                         key: round(float(value), 2)
                         for key, value in emotion_scores.items()
@@ -282,7 +304,7 @@ def predict_image():
 
             except Exception:
                 print(
-                    f"DeepFace: face {face_number} analysis failed",
+                    f"ONNX: face {face_number} analysis failed",
                     flush=True,
                 )
                 traceback.print_exc()
@@ -387,15 +409,14 @@ def handle_frame(data):
 
     try:
         h, w = frame.shape[:2]
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        detections = FACE_CASCADE.detectMultiScale(
+            gray_frame,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(30, 30),
+        )
 
-        with mp_face.FaceDetection(
-            model_selection=0,
-            min_detection_confidence=0.5,
-        ) as detector:
-            results = detector.process(rgb_frame)
-
-        detections = results.detections or []
 
         current_time = time.time()
 
@@ -406,14 +427,12 @@ def handle_frame(data):
 
         # Analyze detected faces at the configured interval
         if do_analysis:
-            for i, detection in enumerate(detections):
+            for i, (x, y, face_w, face_h) in enumerate(detections):
                 try:
-                    box = detection.location_data.relative_bounding_box
-
-                    x1 = max(0, int(box.xmin * w))
-                    y1 = max(0, int(box.ymin * h))
-                    x2 = min(w, int((box.xmin + box.width) * w))
-                    y2 = min(h, int((box.ymin + box.height) * h))
+                    x1 = max(0, int(x))
+                    y1 = max(0, int(y))
+                    x2 = min(w, int(x + face_w))
+                    y2 = min(h, int(y + face_h))
 
                     if x2 <= x1 or y2 <= y1:
                         continue
@@ -422,24 +441,9 @@ def handle_frame(data):
 
                     if face_crop.size == 0:
                         continue
-
-                    face_rgb = cv2.cvtColor(
-                        face_crop, cv2.COLOR_BGR2RGB
+                    dominant, confidence, scores = predict_emotion(
+                        face_crop
                     )
-
-                    result = get_analysis_result(
-                        DeepFace.analyze(
-                            img_path=face_rgb,
-                            actions=["emotion"],
-                            detector_backend="skip",
-                            enforce_detection=False,
-                            silent=True,
-                        )
-                    )
-
-                    scores = result["emotion"]
-                    dominant = max(scores, key=scores.get)
-
                     state["face_emotions"][i] = (
                         dominant,
                         float(scores[dominant]),
@@ -455,13 +459,12 @@ def handle_frame(data):
             state["last_analysis_time"] = current_time
 
         # Draw face boxes and labels
-        for i, detection in enumerate(detections):
-            box = detection.location_data.relative_bounding_box
+        for i, (x, y, face_w, face_h) in enumerate(detections):
+            x1 = max(0, int(x))
+            y1 = max(0, int(y))
+            x2 = min(w, int(x + face_w))
+            y2 = min(h, int(y + face_h))
 
-            x1 = max(0, int(box.xmin * w))
-            y1 = max(0, int(box.ymin * h))
-            x2 = min(w, int((box.xmin + box.width) * w))
-            y2 = min(h, int((box.ymin + box.height) * h))
 
             if x2 <= x1 or y2 <= y1:
                 continue
