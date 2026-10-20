@@ -4,6 +4,10 @@ import base64
 import time
 import traceback
 
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["TF_NUM_INTRAOP_THREADS"] = "1"
+os.environ["TF_NUM_INTEROP_THREADS"] = "1"
+
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -34,31 +38,6 @@ UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 mp_face = mp.solutions.face_detection
-
-
-# =====================================
-# PRE-WARM DEEPFACE MODEL
-# =====================================
-
-print("Pre-loading DeepFace model...", flush=True)
-
-try:
-    dummy = np.zeros((48, 48, 3), dtype=np.uint8)
-
-    DeepFace.analyze(
-        img_path=dummy,
-        actions=["emotion"],
-        detector_backend="skip",
-        enforce_detection=False,
-        silent=True,
-    )
-
-    print("DeepFace ready.", flush=True)
-
-except Exception:
-    print("DeepFace warm-up warning:", flush=True)
-    traceback.print_exc()
-
 
 # =====================================
 # HELPER: GET FIRST ANALYSIS RESULT
