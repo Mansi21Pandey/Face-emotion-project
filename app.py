@@ -151,7 +151,7 @@ def predict_image():
 
         # Resize large images to reduce memory and CPU usage
         h, w = img.shape[:2]
-        max_dimension = 1280
+        max_dimension = 640
 
         if max(h, w) > max_dimension:
             scale = max_dimension / max(h, w)
