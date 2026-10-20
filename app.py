@@ -1,51 +1,84 @@
-from PIL import Image
+
 import os
-import io
 import base64
 import time
-import numpy as np
+import traceback
+
 import cv2
 import mediapipe as mp
+import numpy as np
 from deepface import DeepFace
 from flask import Flask, render_template, request, jsonify
 from flask_socketio import SocketIO, emit
-from PIL import Image
+
 
 # =====================================
 # FLASK + SOCKETIO SETUP
 # =====================================
 
-base_dir = os.path.abspath(os.path.dirname(__file__))
-app = Flask(__name__, template_folder=os.path.join(base_dir, 'templates'), static_folder=os.path.join(base_dir, 'static'))
-app.config["SECRET_KEY"] = "emotion-secret-key"
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+
+app = Flask(
+    __name__,
+    template_folder=os.path.join(BASE_DIR, "templates"),
+    static_folder=os.path.join(BASE_DIR, "static"),
+)
+
+app.config["SECRET_KEY"] = os.environ.get(
+    "SECRET_KEY", "emotion-secret-key"
+)
+
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-UPLOAD_FOLDER = "uploads"
+UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 mp_face = mp.solutions.face_detection
 
+
 # =====================================
-# PRE-WARM DEEPFACE (so first request isn't slow)
+# PRE-WARM DEEPFACE MODEL
 # =====================================
 
-print("Pre-loading DeepFace model...")
-dummy = np.zeros((48, 48, 3), dtype=np.uint8)
+print("Pre-loading DeepFace model...", flush=True)
+
 try:
+    dummy = np.zeros((48, 48, 3), dtype=np.uint8)
+
     DeepFace.analyze(
-        dummy,
+        img_path=dummy,
         actions=["emotion"],
         detector_backend="skip",
         enforce_detection=False,
         silent=True,
     )
-    print("DeepFace ready.")
-except Exception as e:
-    print("Warm-up warning:", e)
+
+    print("DeepFace ready.", flush=True)
+
+except Exception:
+    print("DeepFace warm-up warning:", flush=True)
+    traceback.print_exc()
 
 
 # =====================================
-# ROUTES
+# HELPER: GET FIRST ANALYSIS RESULT
+# =====================================
+
+def get_analysis_result(analysis):
+    """Handle DeepFace results returned as a list or dictionary."""
+    if isinstance(analysis, list):
+        if not analysis:
+            raise ValueError("DeepFace returned an empty result.")
+        return analysis[0]
+
+    if isinstance(analysis, dict):
+        return analysis
+
+    raise ValueError("Unexpected DeepFace result format.")
+
+
+# =====================================
+# PAGE ROUTES
 # =====================================
 
 @app.route("/")
@@ -64,15 +97,22 @@ def realtime_page():
 
 
 # =====================================
-# STATIC IMAGE ENDPOINT
+# FACE DETECTION WITH ROTATION
 # =====================================
 
 def detect_faces_with_rotation(img):
-    """Try 3 orientations, return best one + detections."""
+    """Try original and two rotated orientations."""
+
     rotations = [
         ("Original", img),
-        ("Rotated clockwise", cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)),
-        ("Rotated counterclockwise", cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)),
+        (
+            "Rotated clockwise",
+            cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE),
+        ),
+        (
+            "Rotated counterclockwise",
+            cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE),
+        ),
     ]
 
     best_img = img
@@ -80,11 +120,13 @@ def detect_faces_with_rotation(img):
     best_orientation = "Original"
 
     for orientation, candidate in rotations:
-        rgb_candidate = cv2.cvtColor(candidate, cv2.COLOR_BGR2RGB)
+        rgb_candidate = cv2.cvtColor(
+            candidate, cv2.COLOR_BGR2RGB
+        )
 
         with mp_face.FaceDetection(
             model_selection=0,
-            min_detection_confidence=0.4
+            min_detection_confidence=0.4,
         ) as detector:
             result = detector.process(rgb_candidate)
             detections = result.detections or []
@@ -97,142 +139,257 @@ def detect_faces_with_rotation(img):
     return best_img, best_detections, best_orientation
 
 
+# =====================================
+# STATIC IMAGE PREDICTION
+# =====================================
+
 @app.route("/predict_image", methods=["POST"])
 def predict_image():
-    if "image" not in request.files:
-        return jsonify({"error": "No image uploaded"}), 400
+    start_time = time.time()
 
-    file = request.files["image"]
-    if file.filename == "":
-        return jsonify({"error": "Empty filename"}), 400
+    try:
+        # Validate uploaded file
+        if "image" not in request.files:
+            return jsonify({"error": "No image uploaded"}), 400
 
-    # Read image from request
-    print("PREDICT_IMAGE: request received", flush=True)
-    file_bytes = np.frombuffer(file.read(), np.uint8)
-    img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        file = request.files["image"]
 
-    if img is None:
-        return jsonify({"error": "Invalid image"}), 400
+        if not file.filename:
+            return jsonify({"error": "Empty filename"}), 400
 
-    # Detect faces with rotation logic
-    img, detections, orientation = detect_faces_with_rotation(img)
-    print(
-        f"PREDICT_IMAGE: detections={len(detections)}, "
-        f"orientation={orientation}",
-        flush=True
-    )
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    annotated = img_rgb.copy()
+        print("PREDICT_IMAGE: request received", flush=True)
 
-    h, w = img.shape[:2]
-    face_results = []
+        # Decode uploaded image
+        file_bytes = np.frombuffer(file.read(), np.uint8)
 
-    for face_number, detection in enumerate(detections, start=1):
-        box = detection.location_data.relative_bounding_box
+        if file_bytes.size == 0:
+            return jsonify({"error": "Uploaded file is empty"}), 400
 
-        x1 = max(0, int(box.xmin * w))
-        y1 = max(0, int(box.ymin * h))
-        x2 = min(w, int((box.xmin + box.width) * w))
-        y2 = min(h, int((box.ymin + box.height) * h))
+        img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
-        if x2 <= x1 or y2 <= y1:
-            continue
+        if img is None:
+            return jsonify({"error": "Invalid image"}), 400
 
-        padding = 20
-        y1_p = max(0, y1 - padding)
-        y2_p = min(h, y2 + padding)
-        x1_p = max(0, x1 - padding)
-        x2_p = min(w, x2 + padding)
-        face_crop = img[y1_p:y2_p, x1_p:x2_p]
-        if face_crop.size == 0:
-            continue
+        # Resize large images to reduce memory and CPU usage
+        h, w = img.shape[:2]
+        max_dimension = 1280
 
-        try:
-            face_rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
-            face_pil = Image.fromarray(face_rgb)
-            print(f"DeepFace: analyzing face {face_number}", flush=True)
-            analysis = DeepFace.analyze(
-                img_path=np.array(face_pil),
-                actions=["emotion"],
-                enforce_detection=False,
-                silent=True,
-                detector_backend="skip" 
-                )
+        if max(h, w) > max_dimension:
+            scale = max_dimension / max(h, w)
 
-            emotion_scores = analysis[0]["emotion"]
-            dominant = max(emotion_scores, key=emotion_scores.get)
-            confidence = emotion_scores[dominant]
+            new_w = max(1, int(w * scale))
+            new_h = max(1, int(h * scale))
 
-            face_results.append({
-                "face_number": face_number,
-                "emotion": dominant,
-                "confidence": round(float(confidence), 2),
-                "scores": {k: round(float(v), 2) for k, v in emotion_scores.items()},
-            })
-
-            # Draw rectangle + label
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            label = f"{dominant}: {confidence:.1f}%"
-            text_y = y1 + 25 if y1 + 25 < h else y1 - 10
-            cv2.putText(
-                annotated, label,
-                (x1 + 5, text_y), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
+            img = cv2.resize(
+                img,
+                (new_w, new_h),
+                interpolation=cv2.INTER_AREA,
             )
 
-        except Exception as e:
-            import traceback
-            print(f"Error analyzing face {face_number}: {e}", flush=True)
-            traceback.print_exc()
+        print(
+            f"PREDICT_IMAGE: image prepared in "
+            f"{time.time() - start_time:.2f}s",
+            flush=True,
+        )
 
-    # Encode annotated image to base64
-    annotated_bgr = cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR)
-    _, buffer = cv2.imencode(".png", annotated_bgr)
-    encoded = base64.b64encode(buffer).decode("utf-8")
+        # Detect faces
+        step_time = time.time()
 
-    return jsonify({
-        "annotated_image": f"data:image/png;base64,{encoded}",
-        "orientation": orientation,
-        "faces": face_results,
-        "total_faces": len(face_results),
-    })
+        img, detections, orientation = detect_faces_with_rotation(img)
+
+        print(
+            f"PREDICT_IMAGE: detections={len(detections)}, "
+            f"orientation={orientation}, "
+            f"detection_time={time.time() - step_time:.2f}s",
+            flush=True,
+        )
+
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        annotated = img_rgb.copy()
+
+        h, w = img.shape[:2]
+        face_results = []
+
+        # Analyze each detected face
+        for face_number, detection in enumerate(detections, start=1):
+            try:
+                box = detection.location_data.relative_bounding_box
+
+                x1 = max(0, int(box.xmin * w))
+                y1 = max(0, int(box.ymin * h))
+                x2 = min(w, int((box.xmin + box.width) * w))
+                y2 = min(h, int((box.ymin + box.height) * h))
+
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                padding = 20
+
+                x1_p = max(0, x1 - padding)
+                y1_p = max(0, y1 - padding)
+                x2_p = min(w, x2 + padding)
+                y2_p = min(h, y2 + padding)
+
+                face_crop = img[y1_p:y2_p, x1_p:x2_p]
+
+                if face_crop.size == 0:
+                    continue
+
+                face_rgb = cv2.cvtColor(
+                    face_crop, cv2.COLOR_BGR2RGB
+                )
+
+                print(
+                    f"DeepFace: starting face {face_number}; "
+                    f"crop={face_crop.shape[1]}x{face_crop.shape[0]}",
+                    flush=True,
+                )
+
+                analysis_start = time.time()
+
+                analysis = DeepFace.analyze(
+                    img_path=face_rgb,
+                    actions=["emotion"],
+                    enforce_detection=False,
+                    silent=True,
+                    detector_backend="skip",
+                )
+
+                print(
+                    f"DeepFace: face {face_number} completed in "
+                    f"{time.time() - analysis_start:.2f}s",
+                    flush=True,
+                )
+
+                result = get_analysis_result(analysis)
+                emotion_scores = result["emotion"]
+
+                dominant = max(
+                    emotion_scores, key=emotion_scores.get
+                )
+                confidence = float(emotion_scores[dominant])
+
+                face_results.append({
+                    "face_number": face_number,
+                    "emotion": dominant,
+                    "confidence": round(confidence, 2),
+                    "scores": {
+                        key: round(float(value), 2)
+                        for key, value in emotion_scores.items()
+                    },
+                })
+
+                # Draw bounding box and predicted emotion
+                cv2.rectangle(
+                    annotated,
+                    (x1, y1),
+                    (x2, y2),
+                    (0, 255, 0),
+                    2,
+                )
+
+                label = f"{dominant}: {confidence:.1f}%"
+                text_y = y1 + 25 if y1 + 25 < h else max(20, y1 - 10)
+
+                cv2.putText(
+                    annotated,
+                    label,
+                    (x1 + 5, text_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 0),
+                    2,
+                )
+
+            except Exception:
+                print(
+                    f"DeepFace: face {face_number} analysis failed",
+                    flush=True,
+                )
+                traceback.print_exc()
+
+        # Encode the annotated image
+        annotated_bgr = cv2.cvtColor(
+            annotated, cv2.COLOR_RGB2BGR
+        )
+
+        success, buffer = cv2.imencode(".jpg", annotated_bgr)
+
+        if not success:
+            return jsonify({
+                "error": "Could not encode result image"
+            }), 500
+
+        encoded = base64.b64encode(buffer).decode("utf-8")
+
+        print(
+            f"PREDICT_IMAGE: completed in "
+            f"{time.time() - start_time:.2f}s; "
+            f"successful_faces={len(face_results)}",
+            flush=True,
+        )
+
+        return jsonify({
+            "annotated_image": f"data:image/jpeg;base64,{encoded}",
+            "orientation": orientation,
+            "faces": face_results,
+            "total_faces": len(face_results),
+        })
+
+    except Exception:
+        print("PREDICT_IMAGE: route failed", flush=True)
+        traceback.print_exc()
+
+        return jsonify({
+            "error": "Image processing failed. Please try another image."
+        }), 500
 
 
 # =====================================
 # REAL-TIME WEBSOCKET HANDLER
 # =====================================
 
-# Per-client state
 client_state = {}
+
 
 @socketio.on("connect")
 def handle_connect():
     sid = request.sid
+
     client_state[sid] = {
         "last_analysis_time": 0,
-        "analysis_interval": 1.0,   # seconds
+        "analysis_interval": 1.0,
         "face_emotions": {},
     }
-    print(f"Client connected: {sid}")
+
+    print(f"Client connected: {sid}", flush=True)
 
 
 @socketio.on("disconnect")
 def handle_disconnect():
     sid = request.sid
     client_state.pop(sid, None)
-    print(f"Client disconnected: {sid}")
+
+    print(f"Client disconnected: {sid}", flush=True)
 
 
 def decode_base64_frame(data_url):
-    """Convert data:image/jpeg;base64,... to numpy BGR frame."""
+    """Convert a base64 data URL into an OpenCV BGR frame."""
+
     try:
-        header, encoded = data_url.split(",", 1)
-        img_bytes = base64.b64decode(encoded)
+        if not isinstance(data_url, str) or "," not in data_url:
+            return None
+
+        _, encoded = data_url.split(",", 1)
+        img_bytes = base64.b64decode(encoded, validate=True)
+
         np_arr = np.frombuffer(img_bytes, np.uint8)
         frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
         return frame
-    except Exception as e:
-        print("Frame decode error:", e)
+
+    except Exception as exc:
+        print("Frame decode error:", exc, flush=True)
         return None
 
 
@@ -240,59 +397,88 @@ def decode_base64_frame(data_url):
 def handle_frame(data):
     sid = request.sid
     state = client_state.get(sid)
-    if state is None:
+
+    if state is None or not isinstance(data, dict):
         return
 
     frame = decode_base64_frame(data.get("image", ""))
+
     if frame is None:
         return
 
-    h, w = frame.shape[:2]
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    try:
+        h, w = frame.shape[:2]
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-    with mp_face.FaceDetection(
-        model_selection=0, min_detection_confidence=0.5
-    ) as detector:
-        results = detector.process(rgb_frame)
+        with mp_face.FaceDetection(
+            model_selection=0,
+            min_detection_confidence=0.5,
+        ) as detector:
+            results = detector.process(rgb_frame)
 
-    current_time = time.time()
-    do_analysis = (current_time - state["last_analysis_time"]) >= state["analysis_interval"]
+        detections = results.detections or []
 
-    if results.detections:
-        for i, detection in enumerate(results.detections):
-            box = detection.location_data.relative_bounding_box
-            x1 = max(0, int(box.xmin * w))
-            y1 = max(0, int(box.ymin * h))
-            x2 = min(w, int((box.xmin + box.width) * w))
-            y2 = min(h, int((box.ymin + box.height) * h))
+        current_time = time.time()
 
-            if x2 <= x1 or y2 <= y1:
-                continue
+        do_analysis = (
+            current_time - state["last_analysis_time"]
+            >= state["analysis_interval"]
+        )
 
-            if do_analysis:
-                face_crop = frame[y1:y2, x1:x2]
-                try:
-                    result = DeepFace.analyze(
-                        face_crop,
-                        actions=["emotion"],
-                        detector_backend="skip",
-                        enforce_detection=False,
-                        silent=True,
-                    )
-                    state["face_emotions"][i] = (
-                        result[0]["dominant_emotion"],
-                        float(result[0]["emotion"][result[0]["dominant_emotion"]]),
-                    )
-                except Exception as e:
-                    print("Realtime analysis error:", e)
-
+        # Analyze detected faces at the configured interval
         if do_analysis:
+            for i, detection in enumerate(detections):
+                try:
+                    box = detection.location_data.relative_bounding_box
+
+                    x1 = max(0, int(box.xmin * w))
+                    y1 = max(0, int(box.ymin * h))
+                    x2 = min(w, int((box.xmin + box.width) * w))
+                    y2 = min(h, int((box.ymin + box.height) * h))
+
+                    if x2 <= x1 or y2 <= y1:
+                        continue
+
+                    face_crop = frame[y1:y2, x1:x2]
+
+                    if face_crop.size == 0:
+                        continue
+
+                    face_rgb = cv2.cvtColor(
+                        face_crop, cv2.COLOR_BGR2RGB
+                    )
+
+                    result = get_analysis_result(
+                        DeepFace.analyze(
+                            img_path=face_rgb,
+                            actions=["emotion"],
+                            detector_backend="skip",
+                            enforce_detection=False,
+                            silent=True,
+                        )
+                    )
+
+                    scores = result["emotion"]
+                    dominant = max(scores, key=scores.get)
+
+                    state["face_emotions"][i] = (
+                        dominant,
+                        float(scores[dominant]),
+                    )
+
+                except Exception:
+                    print(
+                        f"Realtime analysis error for face {i}:",
+                        flush=True,
+                    )
+                    traceback.print_exc()
+
             state["last_analysis_time"] = current_time
 
-    # Draw boxes + labels
-    if results.detections:
-        for i, detection in enumerate(results.detections):
+        # Draw face boxes and labels
+        for i, detection in enumerate(detections):
             box = detection.location_data.relative_bounding_box
+
             x1 = max(0, int(box.xmin * w))
             y1 = max(0, int(box.ymin * h))
             x2 = min(w, int((box.xmin + box.width) * w))
@@ -301,43 +487,75 @@ def handle_frame(data):
             if x2 <= x1 or y2 <= y1:
                 continue
 
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.rectangle(
+                frame, (x1, y1), (x2, y2), (0, 255, 0), 2
+            )
 
             if i in state["face_emotions"]:
-                emotion, conf = state["face_emotions"][i]
-                label = f"{emotion}: {conf:.1f}%"
+                emotion, confidence = state["face_emotions"][i]
+                label = f"{emotion}: {confidence:.1f}%"
             else:
                 label = "Analyzing..."
 
             cv2.putText(
-                frame, label,
+                frame,
+                label,
                 (x1, max(25, y1 - 10)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
+                2,
             )
 
-    face_count = len(results.detections) if results.detections else 0
-    cv2.putText(
-        frame, f"Faces: {face_count}",
-        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
-    )
+        face_count = len(detections)
 
-    # Encode annotated frame and send back
-    _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-    encoded = base64.b64encode(buffer).decode("utf-8")
+        cv2.putText(
+            frame,
+            f"Faces: {face_count}",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 0),
+            2,
+        )
 
-    emit("annotated_frame", {
-        "image": f"data:image/jpeg;base64,{encoded}",
-        "face_count": face_count,
-        "emotions": [
-            {"face": k, "emotion": v[0], "confidence": v[1]}
-            for k, v in state["face_emotions"].items()
-        ],
-    })
+        success, buffer = cv2.imencode(
+            ".jpg",
+            frame,
+            [cv2.IMWRITE_JPEG_QUALITY, 80],
+        )
+
+        if not success:
+            return
+
+        encoded = base64.b64encode(buffer).decode("utf-8")
+
+        emit("annotated_frame", {
+            "image": f"data:image/jpeg;base64,{encoded}",
+            "face_count": face_count,
+            "emotions": [
+                {
+                    "face": key,
+                    "emotion": value[0],
+                    "confidence": value[1],
+                }
+                for key, value in state["face_emotions"].items()
+            ],
+        })
+
+    except Exception:
+        print("Realtime frame processing failed:", flush=True)
+        traceback.print_exc()
 
 
 # =====================================
-# RUN
+# RUN LOCALLY
 # =====================================
 
 if __name__ == "__main__":
-    socketio.run(app, host="0.0.0.0", port=5000, debug=True)
+    socketio.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 5000)),
+        debug=False,
+    )
